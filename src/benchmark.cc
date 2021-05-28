@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "benchmark/benchmark.h"
+
 #include "benchmark_api_internal.h"
 #include "benchmark_runner.h"
 #include "internal_macros.h"
@@ -32,7 +33,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -45,11 +49,24 @@
 #include "internal_macros.h"
 #include "log.h"
 #include "mutex.h"
+#include "perf_counters.h"
 #include "re.h"
 #include "statistics.h"
 #include "string_util.h"
 #include "thread_manager.h"
 #include "thread_timer.h"
+
+// Each benchmark can be repeated a number of times, and within each
+// *repetition*, we run the user-defined benchmark function a number of
+// *iterations*. The number of repetitions is determined based on flags
+// (--benchmark_repetitions).
+namespace {
+
+// Attempt to make each repetition run for at least this much of time.
+constexpr double kDefaultMinTimeTotalSecs = 0.5;
+constexpr int kRandomInterleavingDefaultRepetitions = 12;
+
+}  // namespace
 
 // Print a list of benchmarks. This option overrides all other options.
 DEFINE_bool(benchmark_list_tests, false);
@@ -59,16 +76,39 @@ DEFINE_bool(benchmark_list_tests, false);
 // linked into the binary are run.
 DEFINE_string(benchmark_filter, ".");
 
-// Minimum number of seconds we should run benchmark before results are
-// considered significant.  For cpu-time based tests, this is the lower bound
-// on the total cpu time used by all threads that make up the test.  For
-// real-time based tests, this is the lower bound on the elapsed time of the
-// benchmark execution, regardless of number of threads.
-DEFINE_double(benchmark_min_time, 0.5);
+// Do NOT read these flags directly. Use Get*() to read them.
+namespace do_not_read_flag_directly {
+
+// Minimum number of seconds we should run benchmark per repetition before
+// results are considered significant. For cpu-time based tests, this is the
+// lower bound on the total cpu time used by all threads that make up the test.
+// For real-time based tests, this is the lower bound on the elapsed time of the
+// benchmark execution, regardless of number of threads. If left unset, will use
+// kDefaultMinTimeTotalSecs / FLAGS_benchmark_repetitions, if random
+// interleaving is enabled. Otherwise, will use kDefaultMinTimeTotalSecs.
+// Do NOT read this flag directly. Use GetMinTime() to read this flag.
+DEFINE_double(benchmark_min_time, -1.0);
 
 // The number of runs of each benchmark. If greater than 1, the mean and
-// standard deviation of the runs will be reported.
-DEFINE_int32(benchmark_repetitions, 1);
+// standard deviation of the runs will be reported. By default, the number of
+// repetitions is 1 if random interleaving is disabled, and up to
+// kDefaultRepetitions if random interleaving is enabled. (Read the
+// documentation for random interleaving to see why it might be less than
+// kDefaultRepetitions.)
+// Do NOT read this flag directly, Use GetRepetitions() to access this flag.
+DEFINE_int32(benchmark_repetitions, -1);
+
+}  // namespace do_not_read_flag_directly
+
+// The maximum overhead allowed for random interleaving. A value X means total
+// execution time under random interleaving is limited by
+// (1 + X) * original total execution time. Set to 'inf' to allow infinite
+// overhead.
+DEFINE_double(benchmark_random_interleaving_max_overhead, 0.4);
+
+// If set, enable random interleaving. See
+// http://github.com/google/benchmark/issues/1051 for details.
+DEFINE_bool(benchmark_enable_random_interleaving, false);
 
 // Report the result of each benchmark repetitions. When 'true' is specified
 // only the mean, standard deviation, and other statistics are reported for
@@ -106,9 +146,42 @@ DEFINE_bool(benchmark_counters_tabular, false);
 // The level of verbose logging to output
 DEFINE_int32(v, 0);
 
-namespace benchmark {
+// List of additional perf counters to collect, in libpfm format. For more
+// information about libpfm: https://man7.org/linux/man-pages/man3/libpfm.3.html
+DEFINE_string(benchmark_perf_counters, "");
 
+namespace benchmark {
 namespace internal {
+
+// Extra context to include in the output formatted as comma-separated key-value
+// pairs. Kept internal as it's only used for parsing from env/command line.
+DEFINE_kvpairs(benchmark_context, {});
+
+std::map<std::string, std::string>* global_context = nullptr;
+
+// Performance measurements always come with random variances. Defines a
+// factor by which the required number of iterations is overestimated in order
+// to reduce the probability that the minimum time requirement will not be met.
+const double kSafetyMultiplier = 1.4;
+
+// Wraps --benchmark_min_time and returns valid default values if not supplied.
+double GetMinTime() {
+  const double default_min_time = kDefaultMinTimeTotalSecs / GetRepetitions();
+  const double flag_min_time =
+      do_not_read_flag_directly::FLAGS_benchmark_min_time;
+  return flag_min_time >= 0.0 ? flag_min_time : default_min_time;
+}
+
+// Wraps --benchmark_repetitions and return valid default value if not supplied.
+int GetRepetitions() {
+  const int default_repetitions =
+      FLAGS_benchmark_enable_random_interleaving
+          ? kRandomInterleavingDefaultRepetitions
+          : 1;
+  const int flag_repetitions =
+      do_not_read_flag_directly::FLAGS_benchmark_repetitions;
+  return flag_repetitions >= 0 ? flag_repetitions : default_repetitions;
+}
 
 // FIXME: wouldn't LTO mess this up?
 void UseCharPointer(char const volatile*) {}
@@ -117,7 +190,8 @@ void UseCharPointer(char const volatile*) {}
 
 State::State(IterationCount max_iters, const std::vector<int64_t>& ranges,
              int thread_i, int n_threads, internal::ThreadTimer* timer,
-             internal::ThreadManager* manager)
+             internal::ThreadManager* manager,
+             internal::PerfCountersMeasurement* perf_counters_measurement)
     : total_iterations_(0),
       batch_leftover_(0),
       max_iterations(max_iters),
@@ -130,7 +204,8 @@ State::State(IterationCount max_iters, const std::vector<int64_t>& ranges,
       thread_index(thread_i),
       threads(n_threads),
       timer_(timer),
-      manager_(manager) {
+      manager_(manager),
+      perf_counters_measurement_(perf_counters_measurement) {
   CHECK(max_iterations != 0) << "At least one iteration must be run";
   CHECK_LT(thread_index, threads) << "thread_index must be less than threads";
 
@@ -163,11 +238,23 @@ void State::PauseTiming() {
   // Add in time accumulated so far
   CHECK(started_ && !finished_ && !error_occurred_);
   timer_->StopTimer();
+  if (perf_counters_measurement_) {
+    auto measurements = perf_counters_measurement_->StopAndGetMeasurements();
+    for (const auto& name_and_measurement : measurements) {
+      auto name = name_and_measurement.first;
+      auto measurement = name_and_measurement.second;
+      CHECK_EQ(counters[name], 0.0);
+      counters[name] = Counter(measurement, Counter::kAvgIterations);
+    }
+  }
 }
 
 void State::ResumeTiming() {
   CHECK(started_ && !finished_ && !error_occurred_);
   timer_->StartTimer();
+  if (perf_counters_measurement_) {
+    perf_counters_measurement_->Start();
+  }
 }
 
 void State::SkipWithError(const char* msg) {
@@ -215,6 +302,39 @@ void State::FinishKeepRunning() {
 namespace internal {
 namespace {
 
+// Flushes streams after invoking reporter methods that write to them. This
+// ensures users get timely updates even when streams are not line-buffered.
+void FlushStreams(BenchmarkReporter* reporter) {
+  if (!reporter) return;
+  std::flush(reporter->GetOutputStream());
+  std::flush(reporter->GetErrorStream());
+}
+
+// Reports in both display and file reporters.
+void Report(BenchmarkReporter* display_reporter,
+            BenchmarkReporter* file_reporter, const RunResults& run_results) {
+  auto report_one = [](BenchmarkReporter* reporter,
+                       bool aggregates_only,
+                       const RunResults& results) {
+    assert(reporter);
+    // If there are no aggregates, do output non-aggregates.
+    aggregates_only &= !results.aggregates_only.empty();
+    if (!aggregates_only)
+      reporter->ReportRuns(results.non_aggregates);
+    if (!results.aggregates_only.empty())
+      reporter->ReportRuns(results.aggregates_only);
+  };
+
+  report_one(display_reporter, run_results.display_report_aggregates_only,
+             run_results);
+  if (file_reporter)
+    report_one(file_reporter, run_results.file_report_aggregates_only,
+               run_results);
+
+  FlushStreams(display_reporter);
+  FlushStreams(file_reporter);
+}
+
 void RunBenchmarks(const std::vector<BenchmarkInstance>& benchmarks,
                    BenchmarkReporter* display_reporter,
                    BenchmarkReporter* file_reporter) {
@@ -222,16 +342,17 @@ void RunBenchmarks(const std::vector<BenchmarkInstance>& benchmarks,
   CHECK(display_reporter != nullptr);
 
   // Determine the width of the name field using a minimum width of 10.
-  bool might_have_aggregates = FLAGS_benchmark_repetitions > 1;
+  bool might_have_aggregates = GetRepetitions() > 1;
   size_t name_field_width = 10;
   size_t stat_field_width = 0;
   for (const BenchmarkInstance& benchmark : benchmarks) {
     name_field_width =
-        std::max<size_t>(name_field_width, benchmark.name.str().size());
-    might_have_aggregates |= benchmark.repetitions > 1;
+        std::max<size_t>(name_field_width, benchmark.name().str().size());
+    might_have_aggregates |= benchmark.repetitions() > 1;
 
-    for (const auto& Stat : *benchmark.statistics)
+    for (const auto& Stat : benchmark.statistics()) {
       stat_field_width = std::max<size_t>(stat_field_width, Stat.name_.size());
+    }
   }
   if (might_have_aggregates) name_field_width += 1 + stat_field_width;
 
@@ -242,45 +363,61 @@ void RunBenchmarks(const std::vector<BenchmarkInstance>& benchmarks,
   // Keep track of running times of all instances of current benchmark
   std::vector<BenchmarkReporter::Run> complexity_reports;
 
-  // We flush streams after invoking reporter methods that write to them. This
-  // ensures users get timely updates even when streams are not line-buffered.
-  auto flushStreams = [](BenchmarkReporter* reporter) {
-    if (!reporter) return;
-    std::flush(reporter->GetOutputStream());
-    std::flush(reporter->GetErrorStream());
-  };
-
   if (display_reporter->ReportContext(context) &&
       (!file_reporter || file_reporter->ReportContext(context))) {
-    flushStreams(display_reporter);
-    flushStreams(file_reporter);
+    FlushStreams(display_reporter);
+    FlushStreams(file_reporter);
 
-    for (const auto& benchmark : benchmarks) {
-      RunResults run_results = RunBenchmark(benchmark, &complexity_reports);
+    // Without random interleaving, benchmarks are executed in the order of:
+    //   A, A, ..., A, B, B, ..., B, C, C, ..., C, ...
+    // That is, repetition is within RunBenchmark(), hence the name
+    // inner_repetitions.
+    // With random interleaving, benchmarks are executed in the order of:
+    //  {Random order of A, B, C, ...}, {Random order of A, B, C, ...}, ...
+    // That is, repetitions is outside of RunBenchmark(), hence the name
+    // outer_repetitions.
+    int inner_repetitions =
+        FLAGS_benchmark_enable_random_interleaving ? 1 : GetRepetitions();
+    int outer_repetitions =
+        FLAGS_benchmark_enable_random_interleaving ? GetRepetitions() : 1;
+    std::vector<size_t> benchmark_indices(benchmarks.size());
+    for (size_t i = 0; i < benchmarks.size(); ++i) {
+      benchmark_indices[i] = i;
+    }
 
-      auto report = [&run_results](BenchmarkReporter* reporter,
-                                   bool report_aggregates_only) {
-        assert(reporter);
-        // If there are no aggregates, do output non-aggregates.
-        report_aggregates_only &= !run_results.aggregates_only.empty();
-        if (!report_aggregates_only)
-          reporter->ReportRuns(run_results.non_aggregates);
-        if (!run_results.aggregates_only.empty())
-          reporter->ReportRuns(run_results.aggregates_only);
-      };
+    std::random_device rd;
+    std::mt19937 g(rd());
+    // 'run_results_vector' and 'benchmarks' are parallel arrays.
+    std::vector<RunResults> run_results_vector(benchmarks.size());
+    for (int i = 0; i < outer_repetitions; i++) {
+      if (FLAGS_benchmark_enable_random_interleaving) {
+        std::shuffle(benchmark_indices.begin(), benchmark_indices.end(), g);
+      }
+      for (size_t j : benchmark_indices) {
+        // Repetitions will be automatically adjusted under random interleaving.
+        if (!FLAGS_benchmark_enable_random_interleaving ||
+            i < benchmarks[j].RandomInterleavingRepetitions()) {
+          RunBenchmark(benchmarks[j], outer_repetitions, inner_repetitions,
+                       &complexity_reports, &run_results_vector[j]);
+          if (!FLAGS_benchmark_enable_random_interleaving) {
+            // Print out reports as they come in.
+            Report(display_reporter, file_reporter, run_results_vector.at(j));
+          }
+        }
+      }
+    }
 
-      report(display_reporter, run_results.display_report_aggregates_only);
-      if (file_reporter)
-        report(file_reporter, run_results.file_report_aggregates_only);
-
-      flushStreams(display_reporter);
-      flushStreams(file_reporter);
+    if (FLAGS_benchmark_enable_random_interleaving) {
+      // Print out all reports at the end of the test.
+      for (const RunResults& run_results : run_results_vector) {
+        Report(display_reporter, file_reporter, run_results);
+      }
     }
   }
   display_reporter->Finalize();
   if (file_reporter) file_reporter->Finalize();
-  flushStreams(display_reporter);
-  flushStreams(file_reporter);
+  FlushStreams(display_reporter);
+  FlushStreams(file_reporter);
 }
 
 // Disable deprecated warnings temporarily because we need to reference
@@ -377,7 +514,7 @@ size_t RunSpecifiedBenchmarks(BenchmarkReporter* display_reporter,
   if (!fname.empty()) {
     output_file.open(fname);
     if (!output_file.is_open()) {
-      Err << "invalid file name: '" << fname << std::endl;
+      Err << "invalid file name: '" << fname << "'" << std::endl;
       std::exit(1);
     }
     if (!file_reporter) {
@@ -399,7 +536,7 @@ size_t RunSpecifiedBenchmarks(BenchmarkReporter* display_reporter,
 
   if (FLAGS_benchmark_list_tests) {
     for (auto const& benchmark : benchmarks)
-      Out << benchmark.name.str() << "\n";
+      Out << benchmark.name().str() << "\n";
   } else {
     internal::RunBenchmarks(benchmarks, display_reporter, file_reporter);
   }
@@ -411,6 +548,16 @@ void RegisterMemoryManager(MemoryManager* manager) {
   internal::memory_manager = manager;
 }
 
+void AddCustomContext(const std::string& key, const std::string& value) {
+  if (internal::global_context == nullptr) {
+    internal::global_context = new std::map<std::string, std::string>();
+  }
+  if (!internal::global_context->emplace(key, value).second) {
+    std::cerr << "Failed to add custom context \"" << key << "\" as it already "
+              << "exists with value \"" << value << "\"\n";
+  }
+}
+
 namespace internal {
 
 void PrintUsageAndExit() {
@@ -420,6 +567,7 @@ void PrintUsageAndExit() {
           "          [--benchmark_filter=<regex>]\n"
           "          [--benchmark_min_time=<min_time>]\n"
           "          [--benchmark_repetitions=<num_repetitions>]\n"
+          "          [--benchmark_enable_random_interleaving={true|false}]\n"
           "          [--benchmark_report_aggregates_only={true|false}]\n"
           "          [--benchmark_display_aggregates_only={true|false}]\n"
           "          [--benchmark_format=<console|json|csv>]\n"
@@ -427,6 +575,7 @@ void PrintUsageAndExit() {
           "          [--benchmark_out_format=<json|console|csv>]\n"
           "          [--benchmark_color={auto|true|false}]\n"
           "          [--benchmark_counters_tabular={true|false}]\n"
+          "          [--benchmark_context=<key>=<value>,...]\n"
           "          [--v=<verbosity>]\n");
   exit(0);
 }
@@ -439,10 +588,16 @@ void ParseCommandLineFlags(int* argc, char** argv) {
     if (ParseBoolFlag(argv[i], "benchmark_list_tests",
                       &FLAGS_benchmark_list_tests) ||
         ParseStringFlag(argv[i], "benchmark_filter", &FLAGS_benchmark_filter) ||
-        ParseDoubleFlag(argv[i], "benchmark_min_time",
-                        &FLAGS_benchmark_min_time) ||
-        ParseInt32Flag(argv[i], "benchmark_repetitions",
-                       &FLAGS_benchmark_repetitions) ||
+        ParseDoubleFlag(
+            argv[i], "benchmark_min_time",
+            &do_not_read_flag_directly::FLAGS_benchmark_min_time) ||
+        ParseInt32Flag(
+            argv[i], "benchmark_repetitions",
+            &do_not_read_flag_directly::FLAGS_benchmark_repetitions) ||
+        ParseBoolFlag(argv[i], "benchmark_enable_random_interleaving",
+                      &FLAGS_benchmark_enable_random_interleaving) ||
+        ParseDoubleFlag(argv[i], "benchmark_random_interleaving_max_overhead",
+                        &FLAGS_benchmark_random_interleaving_max_overhead) ||
         ParseBoolFlag(argv[i], "benchmark_report_aggregates_only",
                       &FLAGS_benchmark_report_aggregates_only) ||
         ParseBoolFlag(argv[i], "benchmark_display_aggregates_only",
@@ -457,6 +612,10 @@ void ParseCommandLineFlags(int* argc, char** argv) {
         ParseStringFlag(argv[i], "color_print", &FLAGS_benchmark_color) ||
         ParseBoolFlag(argv[i], "benchmark_counters_tabular",
                       &FLAGS_benchmark_counters_tabular) ||
+        ParseStringFlag(argv[i], "benchmark_perf_counters",
+                        &FLAGS_benchmark_perf_counters) ||
+        ParseKeyValueFlag(argv[i], "benchmark_context",
+                          &FLAGS_benchmark_context) ||
         ParseInt32Flag(argv[i], "v", &FLAGS_v)) {
       for (int j = i; j != *argc - 1; ++j) argv[j] = argv[j + 1];
 
@@ -467,12 +626,16 @@ void ParseCommandLineFlags(int* argc, char** argv) {
     }
   }
   for (auto const* flag :
-       {&FLAGS_benchmark_format, &FLAGS_benchmark_out_format})
+       {&FLAGS_benchmark_format, &FLAGS_benchmark_out_format}) {
     if (*flag != "console" && *flag != "json" && *flag != "csv") {
       PrintUsageAndExit();
     }
+  }
   if (FLAGS_benchmark_color.empty()) {
     PrintUsageAndExit();
+  }
+  for (const auto& kv : FLAGS_benchmark_context) {
+    AddCustomContext(kv.first, kv.second);
   }
 }
 
